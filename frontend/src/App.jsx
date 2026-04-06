@@ -9,6 +9,7 @@ let db = null;
 let fbRef, fbSet, fbGet, fbOnValue, fbRemove;
 let firebaseReady = false;
 let firebaseInitPromise = null;
+let lastFirebaseLoadError = null;
 
 function ensureFirebase() {
   if (firebaseInitPromise) return firebaseInitPromise;
@@ -44,6 +45,9 @@ function ensureFirebase() {
 async function saveGroup(code, groupData) {
   console.log("[SnapSort] Saving group:", code, "photos:", groupData.photos?.length);
 
+  let firebaseSaved = false;
+  let firebaseError = null;
+
   // Firebase — save everything under groups/{code}
   if (firebaseReady && db) {
     try {
@@ -65,7 +69,9 @@ async function saveGroup(code, groupData) {
         }
       }
       console.log("[SnapSort] Saved to Firebase OK");
+      firebaseSaved = true;
     } catch (e) {
+      firebaseError = e;
       console.error("[SnapSort] Firebase save error:", e);
     }
   }
@@ -84,10 +90,13 @@ async function saveGroup(code, groupData) {
   } catch (e) {
     console.warn("[SnapSort] localStorage save error:", e);
   }
+
+  return { firebaseSaved, firebaseError };
 }
 
 async function loadGroup(code) {
   console.log("[SnapSort] Loading group:", code, "Firebase ready:", firebaseReady);
+  lastFirebaseLoadError = null;
 
   // Try Firebase first
   if (firebaseReady && db) {
@@ -126,6 +135,7 @@ async function loadGroup(code) {
         };
       }
     } catch (e) {
+      lastFirebaseLoadError = e;
       console.error("[SnapSort] Firebase load error:", e);
     }
   }
@@ -150,6 +160,31 @@ async function loadGroup(code) {
     console.warn("[SnapSort] localStorage load error:", e);
     return null;
   }
+}
+
+function getFirebaseErrorText(err) {
+  const code = typeof err?.code === "string" ? err.code : "";
+  const message = typeof err?.message === "string" ? err.message : "";
+  return `${code} ${message}`.toUpperCase();
+}
+
+function isPermissionDeniedError(err) {
+  return getFirebaseErrorText(err).includes("PERMISSION_DENIED");
+}
+
+async function firebaseGroupExists(code) {
+  if (!firebaseReady || !db) return false;
+  try {
+    const snap = await fbGet(fbRef(db, `groups/${code}/info`));
+    return snap.exists();
+  } catch (e) {
+    lastFirebaseLoadError = e;
+    return false;
+  }
+}
+
+function getFirebaseLoadErrorCode() {
+  return getFirebaseErrorText(lastFirebaseLoadError);
 }
 
 function listenGroup(code, callback) {
@@ -338,7 +373,19 @@ export default function App() {
       people: [],
     };
 
-    await saveGroup(c, g);
+    const saveResult = await saveGroup(c, g);
+    if (firebaseReady && !saveResult.firebaseSaved) {
+      flash("Created locally, but Firebase save failed. Check Realtime Database rules.");
+    } else if (firebaseReady) {
+      const existsInFirebase = await firebaseGroupExists(c);
+      if (!existsInFirebase) {
+        if (isPermissionDeniedError(lastFirebaseLoadError)) {
+          flash("Firebase connected but read blocked (PERMISSION_DENIED). Update read rules.");
+        } else {
+          flash("Group saved locally, but could not verify it in Firebase.");
+        }
+      }
+    }
     localStorage.setItem("snapsort_session", JSON.stringify({ code: c, user: cName.trim() }));
 
     // Start listening
@@ -369,6 +416,8 @@ export default function App() {
       setProc({ active: false, text: "", sub: "", progress: 0 });
       if (!fbOk) {
         flash("Group not found! Firebase is not configured — groups only work on the same device.");
+      } else if (isPermissionDeniedError(lastFirebaseLoadError) || getFirebaseLoadErrorCode().includes("PERMISSION_DENIED")) {
+        flash("Firebase blocked access (PERMISSION_DENIED). Update Realtime Database read rules.");
       } else {
         flash("Group not found! Check the code and try again.");
       }
@@ -383,7 +432,14 @@ export default function App() {
     }
 
     setProc({ active: true, text: "Saving...", sub: "Adding you to the group", progress: 80 });
-    await saveGroup(c, g);
+    const saveResult = await saveGroup(c, g);
+    if (firebaseReady && !saveResult.firebaseSaved) {
+      if (isPermissionDeniedError(saveResult.firebaseError)) {
+        flash("Joined group, but Firebase write is blocked (PERMISSION_DENIED). Update write rules.");
+      } else {
+        flash("Joined locally, but Firebase save failed. Check Realtime Database write rules.");
+      }
+    }
     localStorage.setItem("snapsort_session", JSON.stringify({ code: c, user: jName.trim() }));
 
     // Start listening
