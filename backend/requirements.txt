@@ -1,0 +1,7 @@
+flask==3.1.1
+flask-cors==5.0.1
+deepface==0.0.93
+gunicorn==23.0.0
+Pillow==11.2.1
+numpy==1.26.4
+tf-keras==2.19.0
