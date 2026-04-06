@@ -162,29 +162,9 @@ async function loadGroup(code) {
   }
 }
 
-function getFirebaseErrorText(err) {
-  const code = typeof err?.code === "string" ? err.code : "";
-  const message = typeof err?.message === "string" ? err.message : "";
-  return `${code} ${message}`.toUpperCase();
-}
-
-function isPermissionDeniedError(err) {
-  return getFirebaseErrorText(err).includes("PERMISSION_DENIED");
-}
-
-async function firebaseGroupExists(code) {
-  if (!firebaseReady || !db) return false;
-  try {
-    const snap = await fbGet(fbRef(db, `groups/${code}/info`));
-    return snap.exists();
-  } catch (e) {
-    lastFirebaseLoadError = e;
-    return false;
-  }
-}
-
 function getFirebaseLoadErrorCode() {
-  return getFirebaseErrorText(lastFirebaseLoadError);
+  const code = lastFirebaseLoadError?.code || "";
+  return typeof code === "string" ? code.toUpperCase() : "";
 }
 
 function listenGroup(code, callback) {
@@ -376,15 +356,6 @@ export default function App() {
     const saveResult = await saveGroup(c, g);
     if (firebaseReady && !saveResult.firebaseSaved) {
       flash("Created locally, but Firebase save failed. Check Realtime Database rules.");
-    } else if (firebaseReady) {
-      const existsInFirebase = await firebaseGroupExists(c);
-      if (!existsInFirebase) {
-        if (isPermissionDeniedError(lastFirebaseLoadError)) {
-          flash("Firebase connected but read blocked (PERMISSION_DENIED). Update read rules.");
-        } else {
-          flash("Group saved locally, but could not verify it in Firebase.");
-        }
-      }
     }
     localStorage.setItem("snapsort_session", JSON.stringify({ code: c, user: cName.trim() }));
 
@@ -416,7 +387,7 @@ export default function App() {
       setProc({ active: false, text: "", sub: "", progress: 0 });
       if (!fbOk) {
         flash("Group not found! Firebase is not configured — groups only work on the same device.");
-      } else if (isPermissionDeniedError(lastFirebaseLoadError) || getFirebaseLoadErrorCode().includes("PERMISSION_DENIED")) {
+      } else if (getFirebaseLoadErrorCode().includes("PERMISSION_DENIED")) {
         flash("Firebase blocked access (PERMISSION_DENIED). Update Realtime Database read rules.");
       } else {
         flash("Group not found! Check the code and try again.");
@@ -434,11 +405,7 @@ export default function App() {
     setProc({ active: true, text: "Saving...", sub: "Adding you to the group", progress: 80 });
     const saveResult = await saveGroup(c, g);
     if (firebaseReady && !saveResult.firebaseSaved) {
-      if (isPermissionDeniedError(saveResult.firebaseError)) {
-        flash("Joined group, but Firebase write is blocked (PERMISSION_DENIED). Update write rules.");
-      } else {
-        flash("Joined locally, but Firebase save failed. Check Realtime Database write rules.");
-      }
+      flash("Joined locally, but Firebase save failed. Check Realtime Database write rules.");
     }
     localStorage.setItem("snapsort_session", JSON.stringify({ code: c, user: jName.trim() }));
 
