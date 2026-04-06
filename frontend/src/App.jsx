@@ -2,111 +2,186 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import firebaseConfig, { isFirebaseConfigured } from "./firebase.js";
 import "./styles.css";
 
-// ═══ Firebase — only init if configured ═══
+// ═══════════════════════════════════════════════════
+// Firebase — lazy loaded, awaited before use
+// ═══════════════════════════════════════════════════
 let db = null;
-let fbRef, fbSet, fbGet, fbOnValue;
+let fbRef, fbSet, fbGet, fbOnValue, fbRemove;
+let firebaseReady = false;
+let firebaseInitPromise = null;
 
-async function initFirebase() {
-  if (!isFirebaseConfigured()) return false;
-  try {
-    const appMod = await import("firebase/app");
-    const dbMod = await import("firebase/database");
-    const fbApp = appMod.initializeApp(firebaseConfig);
-    db = dbMod.getDatabase(fbApp);
-    fbRef = dbMod.ref;
-    fbSet = dbMod.set;
-    fbGet = dbMod.get;
-    fbOnValue = dbMod.onValue;
-    return true;
-  } catch (e) {
-    console.warn("Firebase init failed:", e);
-    return false;
+function ensureFirebase() {
+  if (firebaseInitPromise) return firebaseInitPromise;
+  if (!isFirebaseConfigured()) {
+    firebaseInitPromise = Promise.resolve(false);
+    return firebaseInitPromise;
   }
+  firebaseInitPromise = (async () => {
+    try {
+      const appMod = await import("firebase/app");
+      const dbMod = await import("firebase/database");
+      const fbApp = appMod.initializeApp(firebaseConfig);
+      db = dbMod.getDatabase(fbApp);
+      fbRef = dbMod.ref;
+      fbSet = dbMod.set;
+      fbGet = dbMod.get;
+      fbOnValue = dbMod.onValue;
+      fbRemove = dbMod.remove;
+      firebaseReady = true;
+      console.log("[SnapSort] Firebase initialized successfully");
+      return true;
+    } catch (e) {
+      console.error("[SnapSort] Firebase init failed:", e);
+      return false;
+    }
+  })();
+  return firebaseInitPromise;
 }
 
-// ═══ Storage layer — Firebase if available, localStorage fallback ═══
+// ═══════════════════════════════════════════════════
+// Storage — Firebase (cross-device) + localStorage (fallback)
+// ═══════════════════════════════════════════════════
 async function saveGroup(code, groupData) {
-  // Always save to localStorage as backup
-  try {
-    const { photos, ...meta } = groupData;
-    localStorage.setItem(`snapsort_group_${code}`, JSON.stringify(meta));
-    // Save photos in chunks
-    const chunkSize = 2;
-    for (let i = 0; i < photos.length; i += chunkSize) {
-      localStorage.setItem(`snapsort_photos_${code}_${Math.floor(i / chunkSize)}`, JSON.stringify(photos.slice(i, i + chunkSize)));
+  console.log("[SnapSort] Saving group:", code, "photos:", groupData.photos?.length);
+
+  // Firebase — save everything under groups/{code}
+  if (firebaseReady && db) {
+    try {
+      // Save group info (without photos to keep it small)
+      const groupInfo = {
+        name: groupData.name || "",
+        code: code,
+        members: groupData.members || [],
+        people: groupData.people || [],
+        photoCount: groupData.photos?.length || 0,
+        updatedAt: Date.now(),
+      };
+      await fbSet(fbRef(db, `groups/${code}/info`), groupInfo);
+
+      // Save each photo separately
+      if (groupData.photos && groupData.photos.length > 0) {
+        for (let i = 0; i < groupData.photos.length; i++) {
+          await fbSet(fbRef(db, `groups/${code}/photos/${i}`), groupData.photos[i]);
+        }
+      }
+      console.log("[SnapSort] Saved to Firebase OK");
+    } catch (e) {
+      console.error("[SnapSort] Firebase save error:", e);
     }
-    localStorage.setItem(`snapsort_photocount_${code}`, String(Math.ceil(photos.length / chunkSize)));
-  } catch (e) {
-    console.warn("localStorage save error:", e);
   }
 
-  // Also save to Firebase if configured
-  if (db) {
-    try {
-      await fbSet(fbRef(db, `groups/${code}/meta`), (() => {
-        const { photos, ...meta } = groupData;
-        return meta;
-      })());
-      for (let i = 0; i < groupData.photos.length; i++) {
-        await fbSet(fbRef(db, `groups/${code}/photos/${i}`), groupData.photos[i]);
-      }
-      await fbSet(fbRef(db, `groups/${code}/meta/photoCount`), groupData.photos.length);
-    } catch (e) {
-      console.warn("Firebase save error:", e);
+  // localStorage backup
+  try {
+    const { photos, ...meta } = groupData;
+    meta.code = code;
+    localStorage.setItem(`sg_${code}`, JSON.stringify(meta));
+    const cs = 2;
+    const chunks = Math.ceil((photos?.length || 0) / cs);
+    for (let i = 0; i < chunks; i++) {
+      localStorage.setItem(`sp_${code}_${i}`, JSON.stringify(photos.slice(i * cs, (i + 1) * cs)));
     }
+    localStorage.setItem(`sc_${code}`, String(chunks));
+  } catch (e) {
+    console.warn("[SnapSort] localStorage save error:", e);
   }
 }
 
 async function loadGroup(code) {
+  console.log("[SnapSort] Loading group:", code, "Firebase ready:", firebaseReady);
+
   // Try Firebase first
-  if (db) {
+  if (firebaseReady && db) {
     try {
-      const snap = await fbGet(fbRef(db, `groups/${code}`));
-      if (snap.exists()) {
-        const data = snap.val();
-        const meta = data.meta || {};
-        const photos = data.photos ? Object.values(data.photos) : [];
-        return { ...meta, photos, code };
+      // Check if group exists by reading info
+      const infoSnap = await fbGet(fbRef(db, `groups/${code}/info`));
+      console.log("[SnapSort] Firebase info exists:", infoSnap.exists());
+
+      if (infoSnap.exists()) {
+        const info = infoSnap.val();
+
+        // Load photos
+        let photos = [];
+        try {
+          const photosSnap = await fbGet(fbRef(db, `groups/${code}/photos`));
+          if (photosSnap.exists()) {
+            const photosData = photosSnap.val();
+            // Firebase can return object or array
+            if (Array.isArray(photosData)) {
+              photos = photosData.filter(Boolean);
+            } else if (typeof photosData === "object") {
+              photos = Object.values(photosData).filter(Boolean);
+            }
+          }
+        } catch (e) {
+          console.warn("[SnapSort] Photo load error:", e);
+        }
+
+        console.log("[SnapSort] Loaded from Firebase:", info.name, "photos:", photos.length);
+        return {
+          name: info.name || "Group",
+          code: code,
+          members: info.members || [],
+          people: info.people || [],
+          photos: photos,
+        };
       }
     } catch (e) {
-      console.warn("Firebase load error:", e);
+      console.error("[SnapSort] Firebase load error:", e);
     }
   }
 
-  // Fallback to localStorage
+  // Fallback: localStorage
   try {
-    const metaStr = localStorage.getItem(`snapsort_group_${code}`);
-    if (!metaStr) return null;
+    const metaStr = localStorage.getItem(`sg_${code}`);
+    if (!metaStr) {
+      console.log("[SnapSort] Not found in localStorage either");
+      return null;
+    }
     const meta = JSON.parse(metaStr);
-    const chunkCount = parseInt(localStorage.getItem(`snapsort_photocount_${code}`) || "0");
+    const chunks = parseInt(localStorage.getItem(`sc_${code}`) || "0");
     const photos = [];
-    for (let i = 0; i < chunkCount; i++) {
-      const chunk = localStorage.getItem(`snapsort_photos_${code}_${i}`);
+    for (let i = 0; i < chunks; i++) {
+      const chunk = localStorage.getItem(`sp_${code}_${i}`);
       if (chunk) photos.push(...JSON.parse(chunk));
     }
+    console.log("[SnapSort] Loaded from localStorage:", meta.name, "photos:", photos.length);
     return { ...meta, photos, code };
   } catch (e) {
-    console.warn("localStorage load error:", e);
+    console.warn("[SnapSort] localStorage load error:", e);
     return null;
   }
 }
 
 function listenGroup(code, callback) {
-  if (!db) return () => {};
+  if (!firebaseReady || !db) return () => {};
   try {
-    return fbOnValue(fbRef(db, `groups/${code}`), snap => {
+    const unsub = fbOnValue(fbRef(db, `groups/${code}`), snap => {
       if (!snap.exists()) return;
       const data = snap.val();
-      const meta = data.meta || {};
-      const photos = data.photos ? Object.values(data.photos) : [];
-      callback({ ...meta, photos, code });
+      const info = data.info || {};
+      let photos = [];
+      if (data.photos) {
+        if (Array.isArray(data.photos)) photos = data.photos.filter(Boolean);
+        else photos = Object.values(data.photos).filter(Boolean);
+      }
+      callback({
+        name: info.name || "Group",
+        code: code,
+        members: info.members || [],
+        people: info.people || [],
+        photos: photos,
+      });
     });
+    return unsub;
   } catch (e) {
+    console.error("[SnapSort] Listen error:", e);
     return () => {};
   }
 }
 
-// ═══ Config ═══
+// ═══════════════════════════════════════════════════
+// Config & Helpers
+// ═══════════════════════════════════════════════════
 const API = import.meta.env.VITE_API_URL || "";
 const PALETTE = [
   { bg: "linear-gradient(135deg,#f97316,#ea580c)", border: "#f97316" },
@@ -175,7 +250,9 @@ function Overlay({ active, text, sub, progress }) {
   );
 }
 
-// ═══ MAIN APP ═══
+// ═══════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════
 export default function App() {
   const [screen, setScreen] = useState("landing");
   const [modal, setModal] = useState(null);
@@ -194,7 +271,8 @@ export default function App() {
   const [showLogs, setShowLogs] = useState(false);
   const [backendOk, setBackendOk] = useState(null);
   const [firebaseOk, setFirebaseOk] = useState(false);
-  const fRef = useRef(null);
+  const [ready, setReady] = useState(false);
+  const fileRef = useRef(null);
   const logRef = useRef(null);
   const unsubRef = useRef(null);
 
@@ -206,71 +284,123 @@ export default function App() {
     setTimeout(() => logRef.current?.scrollTo(0, logRef.current.scrollHeight), 50);
   }, []);
 
-  // ─── Init ───
+  // ─── Initialize everything on mount ───
   useEffect(() => {
-    // Init Firebase
-    initFirebase().then(ok => {
-      setFirebaseOk(ok);
-      if (ok) addLog("✓ Firebase connected");
-      else addLog("ℹ Firebase not configured — using localStorage (same-device only)");
-    });
-    // Check backend
-    apiHealth(addLog).then(ok => setBackendOk(ok));
-    // Restore session
-    const saved = localStorage.getItem("snapsort_session");
-    if (saved) {
-      try {
-        const { code: c, user: u } = JSON.parse(saved);
-        if (c && u) {
-          setCode(c); setUser(u);
-          loadGroup(c).then(g => {
-            if (g) { setGroup(g); setScreen("dashboard"); }
-          });
+    (async () => {
+      // 1. Init Firebase (wait for it!)
+      const fbOk = await ensureFirebase();
+      setFirebaseOk(fbOk);
+      if (fbOk) addLog("✓ Firebase connected");
+      else addLog("ℹ Firebase not configured — local storage only");
+
+      // 2. Check backend
+      apiHealth(addLog).then(ok => setBackendOk(ok));
+
+      // 3. Restore session
+      const saved = localStorage.getItem("snapsort_session");
+      if (saved) {
+        try {
+          const { code: c, user: u } = JSON.parse(saved);
+          if (c && u) {
+            const g = await loadGroup(c);
+            if (g) {
+              setGroup(g); setCode(c); setUser(u); setScreen("dashboard");
+              // Start listening
+              if (firebaseReady) {
+                unsubRef.current = listenGroup(c, g2 => setGroup(g2));
+              }
+            }
+          }
+        } catch (e) {
+          console.error("[SnapSort] Session restore error:", e);
         }
-      } catch {}
-    }
+      }
+
+      setReady(true);
+    })();
+
     return () => { if (typeof unsubRef.current === "function") unsubRef.current(); };
   }, [addLog]);
 
-  // ─── Start listening when we have a code + firebase ───
-  useEffect(() => {
-    if (code && firebaseOk) {
-      if (typeof unsubRef.current === "function") unsubRef.current();
-      unsubRef.current = listenGroup(code, g => setGroup(g));
-    }
-  }, [code, firebaseOk]);
-
+  // ─── Create Group ───
   const doCreate = async () => {
     if (!gName.trim() || !cName.trim()) return;
+
+    // Make sure Firebase is ready
+    await ensureFirebase();
+
     const c = genCode();
-    const g = { name: gName.trim(), code: c, members: [{ name: cName.trim(), id: Date.now(), isCreator: true }], photos: [], people: [] };
+    const g = {
+      name: gName.trim(),
+      code: c,
+      members: [{ name: cName.trim(), id: Date.now(), isCreator: true }],
+      photos: [],
+      people: [],
+    };
+
     await saveGroup(c, g);
     localStorage.setItem("snapsort_session", JSON.stringify({ code: c, user: cName.trim() }));
+
+    // Start listening
+    if (typeof unsubRef.current === "function") unsubRef.current();
+    if (firebaseReady) unsubRef.current = listenGroup(c, g2 => setGroup(g2));
+
     setGroup(g); setCode(c); setUser(cName.trim());
     setGName(""); setCName(""); setModal(null); setTab("upload"); setScreen("dashboard");
     flash("Group created! Code: " + c);
   };
 
+  // ─── Join Group ───
   const doJoin = async () => {
     const c = jCode.trim().toUpperCase();
     if (!c || !jName.trim()) return;
-    setProc({ active: true, text: "Joining...", sub: "Looking for group " + c, progress: 30 });
+
+    setProc({ active: true, text: "Joining...", sub: "Connecting to Firebase...", progress: 10 });
+
+    // CRITICAL: Wait for Firebase to be ready before trying to load
+    const fbOk = await ensureFirebase();
+    setFirebaseOk(fbOk);
+
+    setProc({ active: true, text: "Joining...", sub: `Looking for group ${c}...`, progress: 30 });
+
     const g = await loadGroup(c);
-    if (!g) { setProc({ active: false, text: "", sub: "", progress: 0 }); flash("Group not found! Check the code."); return; }
+
+    if (!g) {
+      setProc({ active: false, text: "", sub: "", progress: 0 });
+      if (!fbOk) {
+        flash("Group not found! Firebase is not configured — groups only work on the same device.");
+      } else {
+        flash("Group not found! Check the code and try again.");
+      }
+      return;
+    }
+
+    setProc({ active: true, text: "Found it!", sub: `${g.name} — ${g.photos?.length || 0} photos`, progress: 60 });
+
+    // Add member
     if (!g.members?.find(m => m.name === jName.trim())) {
       g.members = [...(g.members || []), { name: jName.trim(), id: Date.now(), isCreator: false }];
-      await saveGroup(c, g);
     }
+
+    setProc({ active: true, text: "Saving...", sub: "Adding you to the group", progress: 80 });
+    await saveGroup(c, g);
     localStorage.setItem("snapsort_session", JSON.stringify({ code: c, user: jName.trim() }));
-    setProc({ active: true, text: `Loaded ${g.photos?.length || 0} photos!`, sub: "", progress: 100 });
-    await sleep(500);
+
+    // Start listening
+    if (typeof unsubRef.current === "function") unsubRef.current();
+    if (firebaseReady) unsubRef.current = listenGroup(c, g2 => setGroup(g2));
+
+    setProc({ active: true, text: `Welcome to ${g.name}!`, sub: `${g.photos?.length || 0} photos loaded`, progress: 100 });
+    await sleep(600);
     setProc({ active: false, text: "", sub: "", progress: 0 });
+
     setGroup(g); setCode(c); setUser(jName.trim());
     setJCode(""); setJName(""); setModal(null); setTab("upload"); setScreen("dashboard");
   };
 
   const copyCode = () => { if (code) { navigator.clipboard.writeText(code); flash("Code copied!"); } };
 
+  // ─── Process Photos ───
   const processPhotos = async files => {
     if (!group) return;
     if (!backendOk) { flash("Backend not connected! Start it first."); return; }
@@ -314,7 +444,7 @@ export default function App() {
     }));
 
     const updated = { ...group, photos: [...(group.photos || []), ...newPhotos], people };
-    setProc({ active: true, text: "Saving...", sub: "Syncing data", progress: 92 });
+    setProc({ active: true, text: "Saving...", sub: "Syncing to Firebase", progress: 92 });
     await saveGroup(code, updated);
     setProc({ active: true, text: "Done! ✨", sub: `${files.length} photos → ${people.length} people`, progress: 100 });
     await sleep(800);
@@ -346,6 +476,18 @@ export default function App() {
   const tFaces = group?.photos?.reduce((s, p) => s + (p.faces?.length || 0), 0) || 0;
   const gShots = group?.photos?.filter(p => (p.faces?.length || 0) > 1).length || 0;
 
+  // Loading state
+  if (!ready) {
+    return (
+      <div className="app" style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
+        <div style={{ textAlign: "center" }}>
+          <div className="spinner" style={{ margin: "0 auto 16px" }}><div /><div /><div /></div>
+          <div style={{ color: "#9896a8" }}>Loading SnapSort...</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       {/* HEADER */}
@@ -357,6 +499,7 @@ export default function App() {
           </div>
           <div className="header-actions">
             <div className={`status-dot ${backendOk === true ? "ok" : backendOk === false ? "err" : "loading"}`} title={backendOk ? "DeepFace connected" : "Backend offline"} />
+            <div className={`status-dot ${firebaseOk ? "ok" : "err"}`} title={firebaseOk ? "Firebase connected" : "Firebase offline"} style={{ marginLeft: -2 }} />
             {screen === "dashboard" && <button className="bs sm" onClick={leave}>← Leave</button>}
             <button className="bs sm" onClick={() => setModal("join")}>Join</button>
             <button className="bp sm" onClick={() => setModal("create")}>+ New</button>
@@ -386,6 +529,7 @@ export default function App() {
         <label>Your Name</label>
         <input className="inp" value={jName} onChange={e => setJName(e.target.value)} placeholder="e.g. Priya" onKeyDown={e => e.key === "Enter" && doJoin()} />
         <button className="bp full" onClick={doJoin}>Join Group →</button>
+        {!firebaseOk && <div style={{ marginTop: 14, padding: 10, background: "rgba(249,115,22,.08)", border: "1px solid rgba(249,115,22,.2)", borderRadius: 8, fontSize: 12, color: "#f97316", lineHeight: 1.5 }}>⚠ Firebase not configured. Joining only works on the same device where the group was created.</div>}
       </Modal>
 
       {/* LANDING */}
@@ -393,7 +537,10 @@ export default function App() {
         <div>
           <section className="hero">
             <div className="hero-glow" />
-            <div className="badge"><span className="badge-dot" /> DeepFace AI • {firebaseOk ? "Firebase Sync" : "Local Storage"}</div>
+            <div className="badge">
+              <span className="badge-dot" />
+              DeepFace AI • {firebaseOk ? "Firebase Sync ✓" : "Local Mode"}
+            </div>
             <h1>Trip photos,<br /><em>auto-sorted.</em></h1>
             <p>Upload group photos. <strong>DeepFace</strong> detects faces with RetinaFace, matches with VGG-Face, and sorts by person.</p>
             <div className="hero-cta">
@@ -408,14 +555,15 @@ export default function App() {
             )}
             {!firebaseOk && (
               <div className="firebase-warning">
-                ℹ Firebase not configured — groups only work on this device. Edit <code>frontend/src/firebase.js</code> to enable cross-device sync.
+                ℹ Firebase not configured — groups only work on this device.<br />
+                Edit <code>frontend/src/firebase.js</code> with your Firebase config for cross-device sync.
               </div>
             )}
           </section>
           <section className="features">
             {[
               { i: "🧠", t: "DeepFace AI", d: "RetinaFace detection + VGG-Face verification. Real neural network face matching via DeepFace.verify().", c: "#f97316" },
-              { i: "🌐", t: firebaseOk ? "Firebase Sync ✓" : "Cross-Device Sync", d: firebaseOk ? "Connected! Groups sync across all devices in real-time." : "Set up Firebase to sync groups across devices. Currently using localStorage.", c: "#a855f7" },
+              { i: "🌐", t: firebaseOk ? "Firebase Sync ✓" : "Cross-Device Sync", d: firebaseOk ? "Connected! Groups sync across all devices in real-time." : "Configure Firebase to sync groups across devices.", c: "#a855f7" },
               { i: "⬇️", t: "Per-Person Download", d: "Download just your photos. Rename detected people. Clean personalized albums.", c: "#ec4899" },
             ].map((f, i) => (
               <div key={i} className="feature-card" style={{ animationDelay: `${i * 0.1}s` }}>
@@ -459,14 +607,14 @@ export default function App() {
 
           {tab === "upload" && (
             <div>
-              <div className="upload-zone" onClick={() => fRef.current?.click()}
+              <div className="upload-zone" onClick={() => fileRef.current?.click()}
                 onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add("drag"); }}
                 onDragLeave={e => e.currentTarget.classList.remove("drag")}
                 onDrop={e => { e.preventDefault(); e.currentTarget.classList.remove("drag"); handleFiles(e.dataTransfer.files); }}>
                 <div className="upload-icon">📁</div>
                 <h3>Drop photos here or click to browse</h3>
                 <p>Sent to DeepFace → {firebaseOk ? "Synced via Firebase" : "Saved locally"}</p>
-                <input ref={fRef} type="file" multiple accept="image/*" style={{ display: "none" }} onChange={e => { handleFiles(e.target.files); e.target.value = ""; }} />
+                <input ref={fileRef} type="file" multiple accept="image/*" style={{ display: "none" }} onChange={e => { handleFiles(e.target.files); e.target.value = ""; }} />
               </div>
 
               <div className="log-controls">
